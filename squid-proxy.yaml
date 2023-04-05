@@ -1,0 +1,87 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: squid-proxy-config
+  labels:
+    app: squid-proxy
+data:
+  squid: |
+    http_access allow all
+    http_port 3128
+
+    debug_options ALL,1 73,9
+    coredump_dir /var/spool/squid
+    refresh_pattern ^ftp:       1440    20% 10080
+    refresh_pattern ^gopher:    1440    0%  1440
+    refresh_pattern -i (/cgi-bin/|\?) 0 0%  0
+    refresh_pattern (Release|Packages(.gz)*)$      0       20%     2880
+    refresh_pattern .       0   20% 4320
+
+    cache_peer 10.217.5.61 parent 3128 0 no-query default login=admin:admin
+    never_direct allow all
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: squid-proxy
+  labels:
+    app: squid-proxy
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500M
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: squid-proxy
+  labels:
+    app: squid-proxy
+spec:
+  ports:
+  - port: 3128
+  selector:
+    app: squid-proxy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: squid-proxy
+  labels:
+    app: squid-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: squid-proxy
+  template:
+    metadata:
+      labels:
+        app: squid-proxy
+    spec:
+      containers:
+      - name: squid
+        image: ubuntu/squid:edge
+        ports:
+        - containerPort: 3128
+          name: squid
+          protocol: TCP
+        volumeMounts:
+        - name: squid-proxy-config-volume
+          mountPath: /etc/squid/squid.conf
+          subPath: squid.conf
+        - name: squid-data
+          mountPath: /var/spool/squid
+      volumes:
+        - name: squid-proxy-config-volume
+          configMap:
+            name: squid-proxy-config
+            items:
+            - key: squid
+              path: squid.conf
+        - name: squid-data
+          persistentVolumeClaim:
+            claimName: squid-proxy

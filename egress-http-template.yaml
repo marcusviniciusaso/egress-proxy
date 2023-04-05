@@ -1,0 +1,205 @@
+kind: Template
+apiVersion: template.openshift.io/v1
+metadata:
+  name: egress-http-template
+  annotations:
+    description: A template to build an Egress Http Proxy
+    iconClass: icon-node
+    openshift.io/display-name: egress-http-template
+    tags: egress-http-template
+    version: 1.0.0
+objects:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: egress-http-proxy-custom
+    data:
+      entrypoint: |-
+        #!/bin/bash
+  
+        # OpenShift egress HTTP proxy setup script
+  
+        set -o errexit
+        set -o nounset
+        set -o pipefail
+  
+        function die() {
+            echo "$*" 1>&2
+            exit 1
+        }
+  
+        if [[ -z "${EGRESS_HTTP_PROXY_DESTINATION}" ]]; then
+            die "No EGRESS_HTTP_PROXY_DESTINATION specified"
+        fi
+  
+        IPADDR_REGEX="[[:xdigit:].:]*[.:][[:xdigit:].:]+"
+        OPT_CIDR_MASK_REGEX="(/[[:digit:]]+)?"
+        HOSTNAME_REGEX="[[:alnum:]][[:alnum:].-]+"
+        DOMAIN_REGEX="\*\.${HOSTNAME_REGEX}"
+  
+        function generate_acls() {
+            n=0
+            saw_wildcard=
+            while read dest; do
+          if [[ "${dest}" =~ ^\w*$ || "${dest}" =~ ^# ]]; then
+              # comment or blank line
+              continue
+          fi
+          n=$(($n + 1))
+  
+          if [[ "${dest}" == "*" ]]; then
+              saw_wildcard=1
+              continue
+          elif [[ -n "${saw_wildcard}" ]]; then
+              die "Wildcard must be last rule, if present"
+          fi
+
+          if [[ "${dest}" =~ ^! ]]; then
+              rule=deny
+              dest="${dest#!}"
+          else
+              rule=allow
+          fi
+  
+          echo ""
+          if [[ "${dest}" =~ ^${IPADDR_REGEX}${OPT_CIDR_MASK_REGEX}$ ]]; then
+              echo acl dest$n dst "${dest}"
+              echo http_access "${rule}" dest$n
+          elif [[ "${dest}" =~ ^${DOMAIN_REGEX}$ ]]; then
+              echo acl dest$n dstdomain "${dest#\*}"
+              echo http_access "${rule}" dest$n
+          elif [[ "${dest}" =~ ^${HOSTNAME_REGEX}$ ]]; then
+              echo acl dest$n dstdomain "${dest}"
+              echo http_access "${rule}" dest$n
+          else
+              die "Bad destination '${dest}'"
+          fi
+            done <<< "${EGRESS_HTTP_PROXY_DESTINATION}"
+  
+            echo ""
+            if [[ -n "${saw_wildcard}" ]]; then
+          echo "http_access allow all"
+            else
+          echo "http_access deny all"
+            fi
+        }
+
+        if [[ "${EGRESS_HTTP_PROXY_MODE:-}" == "unit-test" ]]; then
+            generate_acls
+            exit 0
+        fi
+  
+        CONF=/etc/squid/squid.conf
+        rm -f ${CONF}
+
+        cat > ${CONF} <<EOF
+        acl all src all
+        http_access allow all
+        never_direct allow all
+        http_port 8080
+        cache deny all
+        access_log none all
+        debug_options ALL,0
+        cache_peer ${PROXY_HOST} parent ${PROXY_PORT} 0 no-query default login=${PROXY_USER}:${PROXY_PASSWORD}
+        EOF
+  
+        generate_acls >> ${CONF}
+  
+        echo "Running squid with config:"
+        sed -e 's/^/  /' ${CONF}
+        echo ""
+        echo ""
+  
+        exec squid -N
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      annotations:
+        description: The service to access the Egress Proxy.
+      labels:
+        application: "${APPLICATION_NAME}"
+      name: "${APPLICATION_NAME}"
+    spec:
+      ports:
+        - port: "${{SERVICE_PORT}}"
+          targetPort: 8080
+      selector:
+        deploymentconfig: "${APPLICATION_NAME}"
+  - apiVersion: v1
+    kind: DeploymentConfig
+    metadata:
+      labels:
+        application: "${APPLICATION_NAME}"
+      name: "${APPLICATION_NAME}"
+    spec:
+      replicas: 1
+      selector:
+        deploymentConfig: "${APPLICATION_NAME}"
+      strategy:
+        type: Recreate
+      template:
+        metadata:
+          labels:
+            application: "${APPLICATION_NAME}"
+            deploymentConfig: "${APPLICATION_NAME}"
+          name: "${APPLICATION_NAME}"
+        spec:
+          containers:
+          - command:
+                - "/bin/egress-http-proxy-custom.sh"
+            image: registry.redhat.io/openshift4/ose-egress-http-proxy:v4.10.0-202204211158.p0.g5d526c4.assembly.stream
+            name: "${APPLICATION_NAME}"
+            env:
+              - name: EGRESS_HTTP_PROXY_DESTINATION
+                value: "*"
+            ports:
+              - containerPort: 8080
+                protocol: TCP
+            securityContext:
+              privileged: false
+            volumeMounts:
+              - mountPath: /bin/egress-http-proxy-custom.sh
+                name: egress-http-proxy-custom
+                subPath: egress-http-proxy-custom.sh
+          volumes:
+            - configMap:
+                 defaultMode: 511
+                 items:
+                    - key: entrypoint
+                      path: egress-http-proxy-custom.sh
+                 name: egress-http-proxy-custom
+              name: egress-http-proxy-custom                 
+      triggers:
+        - type: ConfigChange
+parameters:
+  - name: APPLICATION_NAME
+    displayName: Application Name
+    description: The OpenShift application name.
+    value: egress-proxy
+    required: true
+  - name: SERVICE_PORT
+    displayName: Service Port
+    description: The service port to access Egress Proxy.
+    value: "8080"
+    required: true
+  - name: PROXY_HOST
+    displayName: Proxy Host
+    description: The main proxy host
+    required: true
+  - name: PROXY_PORT
+    displayName: Proxy Port
+    description: The main proxy port
+    required: true
+  - name: PROXY_USER
+    displayName: Proxy User
+    description: The main proxy user
+    required: true
+  - name: PROXY_PASSWORD
+    displayName: Proxy Password
+    description: The main proxy password
+    required: true
+  - name: NAMESPACE
+    displayName: Namespace/Project
+    description: The OpenShift namespace/project name
+    required: true
